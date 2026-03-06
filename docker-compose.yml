@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: automl-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-gpt-4}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+    volumes:
+      - ./backend:/app/backend
+      - ./projects:/app/projects
+    command: python backend/main.py
+    networks:
+      - automl-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: automl-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+    volumes:
+      - ./app:/app/app
+      - ./components:/app/components
+      - ./public:/app/public
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - automl-network
+
+networks:
+  automl-network:
+    driver: bridge
+
+volumes:
+  projects:
+    driver: local
