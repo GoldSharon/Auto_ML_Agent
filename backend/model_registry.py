@@ -6,6 +6,11 @@ from sklearn.ensemble import (
 )
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.neural_network import MLPClassifier, MLPRegressor
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+from sklearn.preprocessing import LabelEncoder
 import xgboost as xgb
 from catboost import CatBoostClassifier, CatBoostRegressor
 import logging
@@ -55,12 +60,191 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 N_CORES = multiprocessing.cpu_count()
 logger.info(f"Detected {N_CORES} CPU cores available")
 
+
+# ============================================================================
+# PYTORCH GPU MLP — sklearn-compatible wrapper
+# ============================================================================
+
+class _MLPNet(nn.Module):
+    """Internal PyTorch network used by both classifier and regressor wrappers."""
+
+    def __init__(self, input_dim, output_dim, hidden_layers, activation, dropout):
+        super().__init__()
+        act_map = {
+            "relu": nn.ReLU(),
+            "tanh": nn.Tanh(),
+            "sigmoid": nn.Sigmoid(),
+        }
+        act_fn = act_map.get(activation, nn.ReLU())
+
+        layers = []
+        prev = input_dim
+        for h in hidden_layers:
+            layers += [nn.Linear(prev, h), act_fn, nn.Dropout(dropout)]
+            prev = h
+        layers.append(nn.Linear(prev, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class TorchMLPRegressor(BaseEstimator, RegressorMixin):
+    """
+    GPU-accelerated MLP regressor with a sklearn-compatible API.
+
+    Parameters
+    ----------
+    hidden_layers : tuple  — sizes of hidden layers
+    activation    : str    — "relu", "tanh", or "sigmoid"
+    dropout       : float  — dropout probability
+    lr            : float  — learning rate
+    batch_size    : int    — mini-batch size
+    max_iter      : int    — training epochs
+    random_state  : int    — seed for reproducibility
+    """
+
+    def __init__(self, hidden_layers=(128, 64), activation="relu",
+                 dropout=0.2, lr=1e-3, batch_size=256,
+                 max_iter=100, random_state=42):
+        self.hidden_layers = hidden_layers
+        self.activation = activation
+        self.dropout = dropout
+        self.lr = lr
+        self.batch_size = batch_size
+        self.max_iter = max_iter
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        torch.manual_seed(self.random_state)
+        self.device_ = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        X_t = torch.tensor(np.array(X), dtype=torch.float32)
+        y_t = torch.tensor(np.array(y), dtype=torch.float32).unsqueeze(1)
+
+        dataset = TensorDataset(X_t, y_t)
+        loader  = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        self.model_ = _MLPNet(
+            input_dim=X_t.shape[1],
+            output_dim=1,
+            hidden_layers=self.hidden_layers,
+            activation=self.activation,
+            dropout=self.dropout,
+        ).to(self.device_)
+
+        optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.lr)
+        loss_fn   = nn.MSELoss()
+
+        self.model_.train()
+        for _ in range(self.max_iter):
+            for xb, yb in loader:
+                xb, yb = xb.to(self.device_), yb.to(self.device_)
+                optimizer.zero_grad()
+                loss_fn(self.model_(xb), yb).backward()
+                optimizer.step()
+        return self
+
+    def predict(self, X):
+        self.model_.eval()
+        X_t = torch.tensor(np.array(X), dtype=torch.float32).to(self.device_)
+        with torch.no_grad():
+            preds = self.model_(X_t).squeeze(1).cpu().numpy()
+        return preds
+
+    def score(self, X, y):
+        from sklearn.metrics import r2_score as _r2
+        return _r2(y, self.predict(X))
+
+
+class TorchMLPClassifier(BaseEstimator, ClassifierMixin):
+    """
+    GPU-accelerated MLP classifier with a sklearn-compatible API.
+
+    Parameters
+    ----------
+    hidden_layers : tuple  — sizes of hidden layers
+    activation    : str    — "relu", "tanh", or "sigmoid"
+    dropout       : float  — dropout probability
+    lr            : float  — learning rate
+    batch_size    : int    — mini-batch size
+    max_iter      : int    — training epochs
+    random_state  : int    — seed for reproducibility
+    """
+
+    def __init__(self, hidden_layers=(128, 64), activation="relu",
+                 dropout=0.2, lr=1e-3, batch_size=256,
+                 max_iter=100, random_state=42):
+        self.hidden_layers = hidden_layers
+        self.activation = activation
+        self.dropout = dropout
+        self.lr = lr
+        self.batch_size = batch_size
+        self.max_iter = max_iter
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        torch.manual_seed(self.random_state)
+        self.device_ = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.le_ = LabelEncoder()
+        y_enc = self.le_.fit_transform(y)
+        self.classes_ = self.le_.classes_
+        n_classes = len(self.classes_)
+
+        X_t = torch.tensor(np.array(X), dtype=torch.float32)
+        y_t = torch.tensor(y_enc, dtype=torch.long)
+
+        dataset = TensorDataset(X_t, y_t)
+        loader  = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        self.model_ = _MLPNet(
+            input_dim=X_t.shape[1],
+            output_dim=n_classes,
+            hidden_layers=self.hidden_layers,
+            activation=self.activation,
+            dropout=self.dropout,
+        ).to(self.device_)
+
+        optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.lr)
+        loss_fn   = nn.CrossEntropyLoss()
+
+        self.model_.train()
+        for _ in range(self.max_iter):
+            for xb, yb in loader:
+                xb, yb = xb.to(self.device_), yb.to(self.device_)
+                optimizer.zero_grad()
+                loss_fn(self.model_(xb), yb).backward()
+                optimizer.step()
+        return self
+
+    def predict(self, X):
+        self.model_.eval()
+        X_t = torch.tensor(np.array(X), dtype=torch.float32).to(self.device_)
+        with torch.no_grad():
+            logits = self.model_(X_t)
+            preds  = logits.argmax(dim=1).cpu().numpy()
+        return self.le_.inverse_transform(preds)
+
+    def predict_proba(self, X):
+        self.model_.eval()
+        X_t = torch.tensor(np.array(X), dtype=torch.float32).to(self.device_)
+        with torch.no_grad():
+            probs = torch.softmax(self.model_(X_t), dim=1).cpu().numpy()
+        return probs
+
+    def score(self, X, y):
+        from sklearn.metrics import accuracy_score as _acc
+        return _acc(y, self.predict(X))
+
+
 CPU_MODELS = {
     LearningType.CLASSIFICATION: {
         "logistic": LogisticRegression(max_iter=1000),
         "svm": SVC(),
         "rf": RandomForestClassifier(n_jobs=1),
-        "gb": GradientBoostingClassifier()
+        "gb": GradientBoostingClassifier(),
+        "mlp": MLPClassifier(max_iter=500),  # sklearn MLP has no GPU support, kept here
     },
 
     LearningType.REGRESSION: {
@@ -69,7 +253,8 @@ CPU_MODELS = {
         "svr": SVR(),
         "lasso": Lasso(),
         "rf": RandomForestRegressor(n_jobs=1),
-        "gb": GradientBoostingRegressor()
+        "gb": GradientBoostingRegressor(),
+        "mlp": MLPRegressor(max_iter=500),  # sklearn MLP has no GPU support, kept here
     },
 
     LearningType.CLUSTERING: {
@@ -81,13 +266,13 @@ CPU_MODELS = {
 
 GPU_MODELS = {
     LearningType.CLASSIFICATION: {
-        "mlp": MLPClassifier(max_iter=500),
+        "torch_mlp": TorchMLPClassifier(),
         "xgb": xgb.XGBClassifier(tree_method="auto", n_jobs=1),
         "catboost": CatBoostClassifier(task_type="GPU", verbose=False, allow_writing_files=False)
     },
 
     LearningType.REGRESSION: {
-        "mlp": MLPRegressor(max_iter=500),
+        "torch_mlp": TorchMLPRegressor(),
         "xgb": xgb.XGBRegressor(tree_method="auto", n_jobs=1),
         "catboost": CatBoostRegressor(task_type="GPU", verbose=False, allow_writing_files=False)
     },
@@ -116,7 +301,8 @@ PARAM_WHITELIST = {
                  "border_count", "task_type", "verbose", "allow_writing_files", "random_state"},
     "kmeans": {"n_clusters", "init", "n_init", "max_iter", "tol", "random_state"},
     "dbscan": {"eps", "min_samples", "metric", "algorithm", "leaf_size"},
-    "agglo": {"n_clusters", "linkage", "affinity", "metric"}
+    "agglo": {"n_clusters", "linkage", "affinity", "metric"},
+    "torch_mlp": {"hidden_layers", "activation", "dropout", "lr", "batch_size", "max_iter", "random_state"},
 }
 
 
@@ -250,6 +436,7 @@ def get_model_class(model_name: str, learning_type: LearningType, hardware: Hard
         "svr": SVR,
         # Neural Networks
         "mlp": (MLPClassifier, MLPRegressor),
+        "torch_mlp": (TorchMLPClassifier, TorchMLPRegressor),
         # Boosting
         "xgb": (xgb.XGBClassifier, xgb.XGBRegressor),
         "catboost": (CatBoostClassifier, CatBoostRegressor),
@@ -322,6 +509,8 @@ def create_optuna_objective(model_name: str, model_class, param_config: Dict,
             params['max_iter'] = params.get('max_iter', 1000)
         elif model_name == "mlp":
             params['max_iter'] = params.get('max_iter', 500)
+        elif model_name == "torch_mlp":
+            params['max_iter'] = params.get('max_iter', 100)
         
         # Filter params through whitelist
         params = filter_params(model_name, params)
@@ -443,6 +632,9 @@ def create_model_with_params(model_name: str, learning_type: LearningType,
     elif model_name == "mlp":
         if 'max_iter' not in best_params:
             best_params['max_iter'] = 500
+    elif model_name == "torch_mlp":
+        if 'max_iter' not in best_params:
+            best_params['max_iter'] = 100
     
     # Filter params through whitelist
     best_params = filter_params(model_name, best_params)
@@ -775,9 +967,12 @@ def run_train(ipc: InputConfiguration, X: pd.DataFrame, y=None):
     """Train all models with comprehensive progress tracking."""
     
     cpu_models = CPU_MODELS[ipc.learning_type].copy()
-    gpu_models = GPU_MODELS[ipc.learning_type].copy()
-
     trained_cpu = train_cpu(cpu_models, X, y, ipc)
-    trained_gpu = train_gpu(gpu_models, X, y, ipc)
 
-    return {**trained_cpu, **trained_gpu}
+    # Only run GPU models if GPU hardware is requested
+    if ipc.acceleration_hardware == Hardware.GPU:
+        gpu_models = GPU_MODELS[ipc.learning_type].copy()
+        trained_gpu = train_gpu(gpu_models, X, y, ipc)
+        return {**trained_cpu, **trained_gpu}
+
+    return trained_cpu
