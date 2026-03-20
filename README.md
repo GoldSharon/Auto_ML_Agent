@@ -1,14 +1,7 @@
----
-title: Lightning AutoML
-emoji: ⚡
-colorFrom: indigo
-colorTo: purple
-sdk: docker
-app_port: 7860
-pinned: false
----
 
 # ⚡ Lightning AutoML
+
+🔗 **Live Space:** [huggingface.co/spaces/GoldSharon/lightning-automl](https://huggingface.co/spaces/GoldSharon/lightning-automl)
 
 An end-to-end Automated Machine Learning pipeline — upload a dataset, let the LLM-powered engine analyse it, preprocess it, train multiple models, and make predictions — all through a clean web UI.
 
