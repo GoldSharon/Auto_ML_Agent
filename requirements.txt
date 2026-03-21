@@ -29,4 +29,5 @@ httpx
 requests
 
 
-chardet google-genai
+chardet 
+google-genai
