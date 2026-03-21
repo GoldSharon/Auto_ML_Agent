@@ -4,50 +4,52 @@ import logging
 import os
 import time
 from typing import Optional
- 
-import google.generativeai as genai
+
+from google import genai
+from google.genai import types
 from groq import Groq
 from dotenv import load_dotenv
- 
+
 load_dotenv()
 logger = logging.getLogger(__name__)
- 
- 
+
+
 # ==============================================================================
 # PROVIDER CLIENTS
 # ==============================================================================
- 
+
 def _init_groq() -> Optional[Groq]:
     api_key = os.getenv("GR_API_KEY")
     if not api_key:
         logger.warning("GR_API_KEY not set — Groq disabled")
         return None
     return Groq(api_key=api_key, max_retries=0)
- 
- 
-def _init_gemini() -> bool:
+
+
+def _init_gemini() -> Optional[genai.Client]:
     api_key = os.getenv("GO_API_KEY")
     if not api_key:
         logger.warning("GO_API_KEY not set — Gemini disabled")
-        return False
-    genai.configure(api_key=api_key)
-    return True
- 
- 
-groq_client  = _init_groq()
-gemini_ready = _init_gemini()
- 
- 
+        return None
+    client = genai.Client(api_key=api_key)
+    logger.info("Gemini client initialised (google-genai SDK)")
+    return client
+
+
+groq_client   = _init_groq()
+gemini_client = _init_gemini()
+
+
 # ==============================================================================
 # PROVIDER CALLERS
 # ==============================================================================
- 
+
 def _call_groq(system_instructions: str, user_input: str) -> dict:
     if not groq_client:
         raise RuntimeError("Groq client not initialised")
- 
+
     response = groq_client.chat.completions.create(
-        model=os.getenv("GR_MODEL_NAME", "qwen/qwen3-32b"),
+        model=os.getenv("GR_MODEL_NAME", "llama-3.1-8b-instant"),
         messages=[
             {"role": "system", "content": system_instructions},
             {"role": "user",   "content": user_input},
@@ -61,49 +63,52 @@ def _call_groq(system_instructions: str, user_input: str) -> dict:
     if not content:
         raise ValueError("Groq returned empty content")
     return json.loads(content)
- 
- 
+
+
 def _call_gemini(system_instructions: str, user_input: str) -> dict:
-    if not gemini_ready:
-        raise RuntimeError("Gemini not initialised")
- 
-    model = genai.GenerativeModel(
-        model_name=os.getenv("GO_MODEL_NAME", "gemini-1.5-flash"),
-        system_instruction=system_instructions,
-        generation_config=genai.GenerationConfig(
+    if not gemini_client:
+        raise RuntimeError("Gemini client not initialised — GO_API_KEY missing")
+
+    model_name = os.getenv("GO_MODEL_NAME", "gemini-2.0-flash")
+
+    response = gemini_client.models.generate_content(
+        model=model_name,
+        contents=user_input,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instructions,
             temperature=0.2,
             response_mime_type="application/json",
         ),
     )
-    response = model.generate_content(user_input)
-    content  = response.text
+
+    content = response.text
     if not content:
         raise ValueError("Gemini returned empty content")
     return json.loads(content)
- 
- 
+
+
 # ==============================================================================
 # ROUND-ROBIN PROVIDER REGISTRY
 # ==============================================================================
- 
+
 _PROVIDERS = [
     ("Groq",   _call_groq),
     ("Gemini", _call_gemini),
 ]
- 
+
 # Infinite round-robin iterator — each chat_llm() call pops the next provider
 _provider_cycle = itertools.cycle(_PROVIDERS)
- 
- 
+
+
 def _get_next_provider() -> tuple:
     """Returns the next (name, fn) in round-robin order."""
     return next(_provider_cycle)
- 
- 
+
+
 # ==============================================================================
 # MAIN CALLER — round-robin across providers, fallback on failure
 # ==============================================================================
- 
+
 def chat_llm(system_instructions: str,
              user_input: str,
              num_tries: int = 3,
@@ -112,65 +117,60 @@ def chat_llm(system_instructions: str,
     Calls LLM providers in round-robin order: Groq → Gemini → Groq → …
     Each successive call to chat_llm() uses a different provider automatically,
     spreading the load evenly across both.
- 
+
     On failure, falls back to the other provider before giving up.
     Returns {} only if every available provider fails all attempts.
     """
-    # Start from wherever the round-robin is currently pointing
     primary_name, primary_fn = _get_next_provider()
- 
-    # Build the attempt order: primary first, then the other as fallback
+
     all_providers = _PROVIDERS.copy()
     ordered = [(primary_name, primary_fn)] + [
         (name, fn) for name, fn in all_providers if name != primary_name
     ]
- 
+
     logger.info(f"[LLM] Round-robin selected primary provider: {primary_name}")
- 
+
     for provider_name, provider_fn in ordered:
         logger.info(f"[LLM] Trying provider: {provider_name}")
         last_error = None
- 
+
         for attempt in range(1, num_tries + 1):
             try:
                 logger.info(f"  [{provider_name}] Attempt {attempt}/{num_tries}…")
                 result = provider_fn(system_instructions, user_input)
                 logger.info(f"  [{provider_name}] ✓ Success on attempt {attempt}")
                 return result
- 
+
             except json.JSONDecodeError as e:
-                # Malformed JSON won't improve with retries — skip to next provider
                 logger.error(f"  [{provider_name}] Invalid JSON: {e} — switching provider")
                 last_error = f"invalid JSON: {e}"
                 break
- 
+
             except RuntimeError as e:
-                # Provider not configured — skip immediately, no point retrying
                 logger.warning(f"  [{provider_name}] Not available: {e} — switching provider")
                 last_error = str(e)
                 break
- 
+
             except Exception as e:
                 err        = str(e).lower()
                 last_error = str(e)
- 
+
                 if "429" in err or "rate" in err or "quota" in err:
                     logger.warning(f"  [{provider_name}] Attempt {attempt}: rate limited")
                 elif "timeout" in err:
                     logger.warning(f"  [{provider_name}] Attempt {attempt}: timeout")
                 else:
                     logger.error(f"  [{provider_name}] Attempt {attempt}: {e}")
- 
-            # Wait before retry (skip on final attempt of this provider)
+
             if attempt < num_tries:
                 logger.info(f"  [{provider_name}] Waiting {retry_delay}s before retry…")
                 time.sleep(retry_delay)
- 
+
         logger.warning(
             f"[LLM] {provider_name} exhausted all {num_tries} attempts. "
             f"Last error: {last_error} — trying next provider…"
         )
- 
+
     logger.error("[LLM] All providers failed. Returning empty dict.")
     return {}
 
